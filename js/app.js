@@ -34,8 +34,52 @@
     if (!s.sessionAccountId) s.sessionAccountId = null;
     (s.applications || []).forEach(function (a) {
       if (idMap[a.userId]) a.userId = idMap[a.userId];
+      if (a.educationDate && (!a.educationPeriodStart || !a.educationPeriodEnd)) {
+        if (!a.educationPeriodStart) a.educationPeriodStart = a.educationDate;
+        if (!a.educationPeriodEnd) a.educationPeriodEnd = a.educationDate;
+      }
     });
     return s;
+  }
+
+  function formatEducationPeriod(app) {
+    if (!app) return "—";
+    if (app.educationPeriodStart && app.educationPeriodEnd) {
+      return app.educationPeriodStart + " ~ " + app.educationPeriodEnd;
+    }
+    if (app.educationPeriod) return String(app.educationPeriod);
+    return "—";
+  }
+
+  /** 샘플·데모용 구분 가능한 미리보기 이미지 (SVG data URL) */
+  function svgPlaceholderImage(width, height, bgHex, line1, line2) {
+    function esc(s) {
+      return String(s || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+    var svg =
+      '<svg xmlns="http://www.w3.org/2000/svg" width="' +
+      esc(width) +
+      '" height="' +
+      esc(height) +
+      '"><rect fill="' +
+      esc(bgHex) +
+      '" width="100%" height="100%"/><text x="12" y="30" fill="#ffffff" font-family="Noto Sans KR,system-ui,sans-serif" font-size="14">' +
+      esc(line1) +
+      '</text><text x="12" y="54" fill="rgba(255,255,255,0.9)" font-size="11">' +
+      esc(line2) +
+      "</text></svg>";
+    return "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+  }
+
+  /** 고용24「훈련 통합검색」(HRD-Net 연계) — 훈련기관명 검색어 프리필 */
+  function work24HrdTrainInstitutionSearchUrl(keyword) {
+    var q = String(keyword || "").trim();
+    if (!q) return "";
+    return "https://www.work24.go.kr/hr/a/a/1100/trnnCrsInf.do?keywordTrngNm=" + encodeURIComponent(q);
   }
 
   function loadState() {
@@ -242,6 +286,168 @@
     return /(수료증|이수증|수료완료|이수완료|수료\s*처리|이수\s*처리|수료함|이수함|과정\s*이수|교육\s*이수|교육\s*완료|이수\s*증명|수료\s*증명|Certificate\s+of\s+Completion|Course\s+Completion|이수\s*확인|수료\s*확인|[가-힣A-Za-z0-9]{2,24}이수(?:\s|,|$|\n)|수료(?!\s*불))/i.test(
       t
     );
+  }
+
+  function pad2DatePart(n) {
+    var v = parseInt(n, 10);
+    if (isNaN(v)) return "00";
+    var s = String(v);
+    return s.length === 1 ? "0" + s : s.slice(0, 2);
+  }
+
+  function ymdFromParts(y, mo, d) {
+    var yi = parseInt(y, 10);
+    var mi = parseInt(mo, 10);
+    var di = parseInt(d, 10);
+    if (yi < 2000 || yi > 2035 || mi < 1 || mi > 12 || di < 1 || di > 31) return "";
+    return yi + "-" + pad2DatePart(mi) + "-" + pad2DatePart(di);
+  }
+
+  function extractYmdDatesFromText(text) {
+    var found = [];
+    var t = text || "";
+    var re = /(20\d{2})[\.\-\/년]\s*(\d{1,2})[\.\-\/월]\s*(\d{1,2})\s*일?/g;
+    var m;
+    while ((m = re.exec(t)) !== null) {
+      var ymd = ymdFromParts(m[1], m[2], m[3]);
+      if (ymd && found.indexOf(ymd) < 0) found.push(ymd);
+    }
+    found.sort();
+    return found;
+  }
+
+  function guessPrimaryDateFromReceiptOcr(text) {
+    var dates = extractYmdDatesFromText(text);
+    if (!dates.length) return "";
+    var lines = (text || "").split(/\r?\n/);
+    for (var i = lines.length - 1; i >= 0; i--) {
+      if (/합계|결제|금액|승인|매출|청구|받을/i.test(lines[i])) {
+        for (var j = 0; j < dates.length; j++) {
+          var d = dates[j];
+          var flat = stripSpaces(lines[i]);
+          if (flat.indexOf(stripSpaces(d)) >= 0) return d;
+          if (lines[i].indexOf(d.replace(/-/g, ".")) >= 0) return d;
+          if (lines[i].indexOf(d.replace(/-/g, "/")) >= 0) return d;
+        }
+      }
+    }
+    return dates[dates.length - 1];
+  }
+
+  function guessEducationPeriodBounds(dates) {
+    if (!dates.length) return { start: "", end: "", primary: "" };
+    if (dates.length === 1) return { start: dates[0], end: dates[0], primary: dates[0] };
+    var a = dates[0];
+    var b = dates[dates.length - 1];
+    var dayMs = 86400000;
+    try {
+      var da = new Date(a + "T12:00:00").getTime();
+      var db = new Date(b + "T12:00:00").getTime();
+      if (!isNaN(da) && !isNaN(db)) {
+        var span = Math.abs(db - da) / dayMs;
+        if (span > 0 && span <= 200) {
+          var lo = a < b ? a : b;
+          var hi = a < b ? b : a;
+          return { start: lo, end: hi, primary: hi };
+        }
+      }
+    } catch (e) {}
+    var last = dates[dates.length - 1];
+    return { start: last, end: last, primary: last };
+  }
+
+  function guessVendorFromReceiptOcr(text) {
+    var lines = (text || "")
+      .split(/\r?\n/)
+      .map(function (l) {
+        return l.trim();
+      })
+      .filter(Boolean);
+    var skip =
+      /^영수증|교육비|카드|전표|고객용|merchant|store|tel|phone|fax|www\.|http|금액|합계|공급가|부가세|vat|date|일자|^\d+[\s,원]*$|^[0-9\-\.\/:]+$/i;
+    for (var i = 0; i < lines.length && i < 15; i++) {
+      var line = lines[i];
+      if (line.length < 2 || line.length > 72) continue;
+      if (skip.test(line)) continue;
+      if (/^[\d\s\.,:원\-\/]+$/.test(line)) continue;
+      return line.replace(/\s+/g, " ");
+    }
+    return "";
+  }
+
+  function guessAmountFromReceiptOcr(text) {
+    var t = text || "";
+    var lines = t.split(/\r?\n/);
+    var pool = [];
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+      if (/합계|총\s*결제|결제\s*금액|받을\s*금액|청구\s*금액|카드\s*매출|승인\s*금액/i.test(line)) {
+        extractNumbersFromText(line).forEach(function (n) {
+          if (pool.indexOf(n) < 0) pool.push(n);
+        });
+      }
+    }
+    if (!pool.length) pool = extractNumbersFromText(t);
+    var best = 0;
+    pool.forEach(function (n) {
+      if (n >= 100 && n <= 80000000 && n > best) best = n;
+    });
+    return best;
+  }
+
+  function guessReceiptNoFromReceiptOcr(text) {
+    var t = text || "";
+    var m = t.match(/승인\s*번호\s*[:\s#]*([0-9A-Z*\-]{4,32})/i);
+    if (m) return m[1].replace(/\s/g, "").slice(0, 32);
+    m = t.match(/승인\s*No\.?\s*[:\s#]*([0-9A-Z*\-]{4,32})/i);
+    if (m) return m[1].replace(/\s/g, "").slice(0, 32);
+    m = t.match(/(카드)?\s*승인\s*[:\s#]*([0-9]{8,20})/i);
+    if (m && m[2]) return m[2].slice(0, 32);
+    m = t.match(/거래\s*번호\s*[:\s]*([0-9A-Z\-]{6,28})/i);
+    if (m) return m[1].replace(/\s/g, "").slice(0, 28);
+    return "";
+  }
+
+  /** 신청 폼 자동 채우기용: 영수증·수료증 OCR 본문에서 필드 추정 */
+  function inferApplyFormFromOcr(receiptText, certText) {
+    var r = receiptText || "";
+    var c = certText || "";
+    var combined = r + "\n" + c;
+    var dates = extractYmdDatesFromText(r);
+    if (!dates.length) dates = extractYmdDatesFromText(c);
+    var primary = guessPrimaryDateFromReceiptOcr(r);
+    if (!primary && dates.length) primary = dates[dates.length - 1];
+    var bounds = guessEducationPeriodBounds(dates);
+    if (!bounds.primary && primary) bounds = { start: primary, end: primary, primary: primary };
+    if (bounds.primary && !bounds.start) bounds.start = bounds.primary;
+    if (bounds.primary && !bounds.end) bounds.end = bounds.primary;
+
+    var vendor = guessVendorFromReceiptOcr(r);
+    var amt = guessAmountFromReceiptOcr(r);
+    var receiptNo = guessReceiptNoFromReceiptOcr(r);
+    if (!receiptNo) receiptNo = "OCR-" + Date.now().toString(36).slice(-12);
+
+    var cat = "기타";
+    if (/도서|서적|서점|리브로|교보문고|yes\s*24|알라딘|인터파크\s*도서/i.test(r)) cat = "도서";
+    else if (/응시|시험료|접수비|수험료/i.test(r)) cat = "응시료";
+    else if (/세미나|컨퍼런스|forum|심포지엄/i.test(r)) cat = "세미나";
+    else if (certificateCompletionVerified(c)) cat = "교육비";
+    else if (/교육|과정|수강|훈련|강의|아카데미|평생|이러닝|부트캠프|입문|심화/i.test(r)) cat = "교육비";
+
+    var meth = "오프라인";
+    if (/온라인|원격|이러닝|zoom|teams|webex|vod|동영상|비대면|e\s*learning/i.test(combined)) meth = "온라인";
+    else if (/혼합|blended|온\s*오프/i.test(combined)) meth = "혼합";
+
+    return {
+      vendor: vendor,
+      educationDate: bounds.primary || primary || "",
+      periodStart: bounds.start || bounds.primary || primary || "",
+      periodEnd: bounds.end || bounds.primary || primary || "",
+      amount: amt,
+      receiptNo: receiptNo,
+      category: cat,
+      method: meth,
+    };
   }
 
   function duplicateReceiptNo(state, app, receiptNo) {
@@ -463,50 +669,134 @@
   function seedDemoApplications(state) {
     var empId = firstEmployeeAccountId(state);
     var now = new Date().toISOString();
-    var tinyPng =
-      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
-    var receiptSynth =
-      "한국능률협회\n교육비 영수증\n2026-04-10\n공급가액 163636\n부가세 16364\n합계 180000원\n승인번호 DEMO";
-    var certSynth = "수료증\n교육과정 파이썬 입문\n이수 완료";
-    var base = {
-      userId: empId,
-      createdAt: now,
-      educationDate: "2026-04-10",
-      vendor: "한국능률협회",
-      method: "오프라인",
-      category: "교육비",
-      amount: 180000,
-      taxable: false,
-      jobRelated: "yes",
-      receiptName: "sample-receipt.png",
-      receiptDataUrl: tinyPng,
-      certificateName: "sample-cert.png",
-      certificateDataUrl: tinyPng,
-      managerNote: "",
-      adminNote: "",
-    };
-    var a1 = Object.assign({}, base, {
-      id: uid(),
-      status: "pending_manager",
-      receiptNo: "DEMO-SEED-PM-" + Math.random().toString(36).slice(2, 7),
-    });
-    a1.ocr = mergeOcrResult(a1, { applications: state.applications.concat([a1]) }, receiptSynth, certSynth);
-    a1.autoEligible = a1.ocr.confidence >= 0.98 && a1.ocr.vendorMatch && a1.ocr.dateMatch && a1.ocr.amountMatch;
+    var rnd = Math.random().toString(36).slice(2, 6);
 
-    var receipt2 = "교보문고\n2026-04-10\n도서\n합계 45000원\n카드매출전표";
-    var cert2 = "수료증\n독서교육 이수";
-    var a2 = Object.assign({}, base, {
-      id: uid(),
-      status: "pending_admin",
-      receiptNo: "DEMO-SEED-PA-" + Math.random().toString(36).slice(2, 7),
-      amount: 45000,
-      vendor: "교보문고",
-      managerNote: "직무 관련 확인됨",
-    });
-    a2.ocr = mergeOcrResult(a2, { applications: state.applications.concat([a1, a2]) }, receipt2, cert2);
-    a2.autoEligible = a2.ocr.confidence >= 0.98 && a2.ocr.vendorMatch && a2.ocr.dateMatch && a2.ocr.amountMatch;
+    var specs = [
+      {
+        status: "pending_manager",
+        educationDate: "2026-04-10",
+        educationPeriodStart: "2026-04-08",
+        educationPeriodEnd: "2026-04-10",
+        vendor: "한국능률협회",
+        method: "오프라인",
+        category: "교육비",
+        amount: 180000,
+        receiptSynth:
+          "한국능률협회\n교육비 영수증\n2026-04-10\n공급가액 163636\n부가세 16364\n합계 180000원\n승인번호 DEMO",
+        certSynth: "수료증\n교육과정 파이썬 입문\n이수 완료",
+        receiptNo: "DEMO-SEED-01-" + rnd,
+        managerNote: "",
+        adminNote: "",
+        receiptImg: svgPlaceholderImage(300, 110, "#0c4a6e", "영수증 샘플 ①", "한국능률협회 · 180,000원"),
+        certImg: svgPlaceholderImage(260, 96, "#047857", "수료증 샘플 ①", "파이썬 입문 · 수료"),
+      },
+      {
+        status: "pending_admin",
+        educationDate: "2026-04-10",
+        educationPeriodStart: "2026-04-05",
+        educationPeriodEnd: "2026-04-10",
+        vendor: "교보문고",
+        method: "오프라인",
+        category: "도서",
+        amount: 45000,
+        receiptSynth: "교보문고\n2026-04-10\n도서\n합계 45000원\n카드매출전표",
+        certSynth: "영수증\n구매 확인\n2026-04-10",
+        receiptNo: "DEMO-SEED-02-" + rnd,
+        managerNote: "직무 관련 확인됨",
+        adminNote: "",
+        receiptImg: svgPlaceholderImage(300, 110, "#7c2d12", "영수증 샘플 ②", "교보문고 · 도서"),
+        certImg: svgPlaceholderImage(260, 96, "#92400e", "구매 확인 ②", "독서교육 도서"),
+      },
+      {
+        status: "approved",
+        educationDate: "2026-03-15",
+        educationPeriodStart: "2026-03-01",
+        educationPeriodEnd: "2026-03-15",
+        vendor: "패스트캠퍼스",
+        method: "온라인",
+        category: "교육비",
+        amount: 220000,
+        receiptSynth: "패스트캠퍼스\n2026-03-15\n교육비\n합계 220000원\n온라인 결제",
+        certSynth: "수료증\nReact 심화 과정\n교육 이수 완료",
+        receiptNo: "DEMO-SEED-03-" + rnd,
+        managerNote: "직무 연관",
+        adminNote: "정산 완료",
+        receiptImg: svgPlaceholderImage(300, 110, "#3730a3", "영수증 샘플 ③", "패스트캠퍼스"),
+        certImg: svgPlaceholderImage(260, 96, "#4c1d95", "수료증 샘플 ③", "React 심화 · 수료"),
+      },
+      {
+        status: "pending_manager",
+        educationDate: "2026-02-20",
+        educationPeriodStart: "2026-02-18",
+        educationPeriodEnd: "2026-02-20",
+        vendor: "한국생산성본부",
+        method: "오프라인",
+        category: "세미나",
+        amount: 99000,
+        receiptSynth: "한국생산성본부\n2026-02-20\n세미나\n합계 99000원\n현금영수증",
+        certSynth: "이수증\n리더십 세미나\n수료 확인",
+        receiptNo: "DEMO-SEED-04-" + rnd,
+        managerNote: "",
+        adminNote: "",
+        receiptImg: svgPlaceholderImage(300, 110, "#134e4a", "영수증 샘플 ④", "생산성본부 · 세미나"),
+        certImg: svgPlaceholderImage(260, 96, "#115e59", "이수증 샘플 ④", "리더십 세미나"),
+      },
+      {
+        status: "rejected",
+        educationDate: "2026-01-20",
+        educationPeriodStart: "2026-01-06",
+        educationPeriodEnd: "2026-01-20",
+        vendor: "인프런",
+        method: "온라인",
+        category: "교육비",
+        amount: 89000,
+        receiptSynth: "인프런\n2026-01-20\n강의\n합계 89000원\n카드",
+        certSynth: "수료증\n백엔드 로드맵\n이수",
+        receiptNo: "DEMO-SEED-05-" + rnd,
+        managerNote: "증빙 보완 요청",
+        adminNote: "영수증 상 호 불일치로 반려",
+        receiptImg: svgPlaceholderImage(300, 110, "#831843", "영수증 샘플 ⑤", "인프런"),
+        certImg: svgPlaceholderImage(260, 96, "#9f1239", "수료증 샘플 ⑤", "백엔드 로드맵"),
+      },
+    ];
 
-    state.applications.push(a1, a2);
+    var batch = [];
+    specs.forEach(function (spec) {
+      var a = {
+        id: uid(),
+        userId: empId,
+        createdAt: now,
+        status: spec.status,
+        educationDate: spec.educationDate,
+        educationPeriodStart: spec.educationPeriodStart,
+        educationPeriodEnd: spec.educationPeriodEnd,
+        vendor: spec.vendor,
+        method: spec.method,
+        category: spec.category,
+        amount: spec.amount,
+        taxable: false,
+        jobRelated: "yes",
+        receiptNo: spec.receiptNo,
+        receiptName: "demo-receipt-" + spec.receiptNo + ".svg",
+        receiptDataUrl: spec.receiptImg,
+        certificateName: "demo-cert-" + spec.receiptNo + ".svg",
+        certificateDataUrl: spec.certImg,
+        managerNote: spec.managerNote,
+        adminNote: spec.adminNote,
+        ocr: null,
+      };
+      a.ocr = mergeOcrResult(a, { applications: state.applications.concat(batch).concat([a]) }, spec.receiptSynth, spec.certSynth);
+      a.autoEligible =
+        a.ocr.confidence >= 0.98 &&
+        a.ocr.vendorMatch &&
+        a.ocr.dateMatch &&
+        a.ocr.amountMatch &&
+        (!a.ocr.completionRequired || a.ocr.completionVerified);
+      batch.push(a);
+    });
+    batch.forEach(function (a) {
+      state.applications.push(a);
+    });
     saveState(state);
   }
 
@@ -625,7 +915,7 @@
             class: "btn btn-ghost",
             onclick: function () {
               seedDemoApplications(state);
-              alert("샘플 신청 2건이 추가되었습니다.\n- 신청자 화면에서 내역 확인\n- 부서장·담당자 화면에서 결재 흐름 확인");
+              alert("샘플 신청 5건이 추가되었습니다.\n- 신청자 화면에서 내역·교육기간·이미지 미리보기 확인\n- 부서장·담당자 화면에서 결재 흐름 확인");
             },
           },
           ["데모용 샘플 신청 넣기"]
@@ -734,7 +1024,7 @@
     var tbl = el("table", { class: "ledger-table" });
     tbl.appendChild(
       el("thead", {}, [
-        el("tr", {}, ["일자", "교육업체", "신청금액", "상태", "누적(확정+진행)"].map(function (h) {
+        el("tr", {}, ["일자", "교육기간", "교육업체", "신청금액", "상태", "누적(확정+진행)"].map(function (h) {
           return el("th", {}, [h]);
         })),
       ])
@@ -751,6 +1041,7 @@
         tbody.appendChild(
           el("tr", { onclick: function () { setHash("detail", a.id); }, style: "cursor:pointer" }, [
             el("td", {}, [a.educationDate || "—"]),
+            el("td", { style: "font-size:0.8rem;color:var(--muted)" }, [formatEducationPeriod(a)]),
             el("td", {}, [a.vendor || "—"]),
             el("td", { class: "num" }, [money(a.amount)]),
             el("td", {}, [STATUS_LABEL[a.status] || a.status]),
@@ -759,7 +1050,7 @@
         );
       });
     if (!apps.length) {
-      tbody.appendChild(el("tr", {}, [el("td", { colspan: "5", style: "color:var(--muted)" }, ["신청 내역이 없습니다."])]));
+      tbody.appendChild(el("tr", {}, [el("td", { colspan: "6", style: "color:var(--muted)" }, ["신청 내역이 없습니다."])]));
     }
     tbl.appendChild(tbody);
     tableCard.appendChild(tbl);
@@ -783,7 +1074,7 @@
       list.appendChild(
         el("div", { class: "item", onclick: function () { setHash("detail", a.id); } }, [
           el("h3", {}, [a.vendor + " · " + money(a.amount)]),
-          el("p", {}, [a.educationDate + " · " + (STATUS_LABEL[a.status] || a.status)]),
+          el("p", {}, [formatEducationPeriod(a) + " · " + a.educationDate + " · " + (STATUS_LABEL[a.status] || a.status)]),
         ])
       );
     });
@@ -816,13 +1107,13 @@
     form.appendChild(el("h2", {}, ["스마트 신청서"]));
     form.appendChild(
       el("p", { style: "margin:0 0 1rem;color:var(--muted);font-size:0.85rem" }, [
-        "제출 시 영수증(필수)에서 ",
-        el("strong", {}, ["OCR"]),
-        "으로 업체명·일자·금액을 대조합니다. ",
+        "영수증(필수)과 수료증을 첨부하면 ",
+        el("strong", {}, ["OCR로 신청 내용(상호·일자·교육기간·금액·영수증 번호·종류·방식 등)을 자동 입력"]),
+        "합니다. 값은 원본과 꼭 대조해 수정하세요. 제출 시에는 다시 OCR로 검수합니다. ",
         el("strong", { style: "color:var(--warn)" }, ["교육비·세미나"]),
         "는 수료증 첨부가 ",
         el("strong", {}, ["필수"]),
-        "이며, 수료증 이미지에서 ",
+        "이며, 수료증에서 ",
         el("strong", {}, ["수료·이수(또는 수료증/이수증)"]),
         " 문구가 OCR로 확인되어야 제출됩니다.",
       ])
@@ -834,6 +1125,8 @@
     }
 
     var educationDate = el("input", { type: "date", name: "educationDate", required: true });
+    var educationPeriodStart = el("input", { type: "date", name: "educationPeriodStart", required: true });
+    var educationPeriodEnd = el("input", { type: "date", name: "educationPeriodEnd", required: true });
     var vendor = el("input", { type: "text", name: "vendor", placeholder: "영수증과 동일한 상호", required: true });
     var method = el("select", { name: "method" }, null);
     ["온라인", "오프라인", "혼합"].forEach(function (t) {
@@ -875,8 +1168,18 @@
     }
     category.addEventListener("change", syncCertRequirementUi);
 
+    var periodWrap = el("div", { class: "field" }, [
+      el("label", {}, ["교육기간 (시작 ~ 종료)"]),
+      el("div", { class: "row", style: "flex-wrap:wrap;align-items:center;gap:0.5rem" }, [
+        educationPeriodStart,
+        el("span", { style: "color:var(--muted);font-size:0.85rem" }, ["~"]),
+        educationPeriodEnd,
+      ]),
+    ]);
+
     var left = el("div", {}, [
       field("교육일자 (영수증과 동일)", educationDate),
+      periodWrap,
       field("교육업체 상호", vendor),
       field("교육방식", method),
       field("종류", category),
@@ -906,6 +1209,79 @@
 
     var msg = el("p", { style: "color:var(--muted);min-height:1.4em;margin:0.5rem 0 0;font-size:0.9rem" }, [""]);
     form.appendChild(msg);
+
+    var autofillSeq = 0;
+    var autofillTimer = null;
+    function applyFormAutofillFromInfer(inf) {
+      if (!inf) return;
+      if (inf.vendor) vendor.value = inf.vendor;
+      if (inf.educationDate) educationDate.value = inf.educationDate;
+      if (inf.periodStart) educationPeriodStart.value = inf.periodStart;
+      if (inf.periodEnd) educationPeriodEnd.value = inf.periodEnd;
+      if (inf.amount != null && inf.amount > 0) amount.value = String(Math.round(inf.amount));
+      if (inf.receiptNo) receiptNo.value = inf.receiptNo;
+      if (inf.category) category.value = inf.category;
+      if (inf.method) method.value = inf.method;
+      syncCertRequirementUi();
+    }
+    function scheduleAutofillFromImages() {
+      clearTimeout(autofillTimer);
+      autofillTimer = setTimeout(function () {
+        runAutofillFromImages();
+      }, 450);
+    }
+    function runAutofillFromImages() {
+      var f = receiptFile.files && receiptFile.files[0];
+      if (!f) {
+        msg.textContent = "";
+        return;
+      }
+      if (!getTesseract()) {
+        msg.style.color = "var(--warn)";
+        msg.textContent = "Tesseract가 없어 자동 입력을 할 수 없습니다. 인터넷 연결 후 페이지를 새로고침해 주세요.";
+        return;
+      }
+      var seq = ++autofillSeq;
+      msg.style.color = "var(--muted)";
+      msg.textContent = "영수증·수료증 이미지 OCR로 입력란을 채우는 중…";
+      readFileAsDataUrl(f)
+        .then(function (url) {
+          if (seq !== autofillSeq) return null;
+          if (!url || url.length > 3500000) {
+            msg.style.color = "var(--warn)";
+            msg.textContent = "이미지가 커서 자동 OCR을 건너뜁니다. (약 3MB 이하 권장)";
+            return null;
+          }
+          return recognizeImage(url, function () {});
+        })
+        .then(function (receiptText) {
+          if (seq !== autofillSeq || receiptText == null) return null;
+          var cf = certFile.files && certFile.files[0];
+          if (!cf) return Promise.resolve({ receiptText: receiptText || "", certText: "" });
+          return readFileAsDataUrl(cf).then(function (url2) {
+            if (seq !== autofillSeq) return { receiptText: receiptText || "", certText: "" };
+            if (!url2 || url2.length > 3500000) return { receiptText: receiptText || "", certText: "" };
+            return recognizeImage(url2, function () {}).then(function (certText) {
+              return { receiptText: receiptText || "", certText: certText || "" };
+            });
+          });
+        })
+        .then(function (pair) {
+          if (seq !== autofillSeq || !pair) return;
+          var inf = inferApplyFormFromOcr(pair.receiptText, pair.certText);
+          applyFormAutofillFromInfer(inf);
+          msg.style.color = "var(--success)";
+          msg.textContent =
+            "영수증·수료증 OCR 결과로 입력란을 채웠습니다. 원본과 다르면 직접 수정한 뒤 제출하세요.";
+        })
+        .catch(function (err) {
+          if (seq !== autofillSeq) return;
+          msg.style.color = "var(--danger)";
+          msg.textContent = "자동 입력(OCR) 실패: " + (err && err.message ? err.message : String(err));
+        });
+    }
+    receiptFile.addEventListener("change", scheduleAutofillFromImages);
+    certFile.addEventListener("change", scheduleAutofillFromImages);
 
     var submitRow = el("div", { class: "row", style: "margin-top:0.5rem" });
     var submitBtn = el("button", { type: "submit", class: "btn btn-primary" }, ["제출 및 실제 OCR 검수"]);
@@ -946,12 +1322,35 @@
             submitBtn.disabled = false;
             return;
           }
+          var pStart = educationPeriodStart.value;
+          var pEnd = educationPeriodEnd.value;
+          if (!pStart || !pEnd) {
+            msg.style.color = "var(--danger)";
+            msg.textContent = "교육기간 시작·종료일을 모두 선택해 주세요.";
+            submitBtn.disabled = false;
+            return;
+          }
+          if (pStart > pEnd) {
+            msg.style.color = "var(--danger)";
+            msg.textContent = "교육기간 종료일이 시작일보다 빠를 수 없습니다.";
+            submitBtn.disabled = false;
+            return;
+          }
+          var eduDay = educationDate.value;
+          if (eduDay && (eduDay < pStart || eduDay > pEnd)) {
+            msg.style.color = "var(--danger)";
+            msg.textContent = "교육일자는 교육기간(시작~종료) 안의 날짜로 맞춰 주세요.";
+            submitBtn.disabled = false;
+            return;
+          }
           var app = {
             id: uid(),
             userId: acc.id,
             createdAt: new Date().toISOString(),
             status: "ocr",
             educationDate: educationDate.value,
+            educationPeriodStart: pStart,
+            educationPeriodEnd: pEnd,
             vendor: vendor.value.trim(),
             method: method.value,
             category: category.value,
@@ -1120,6 +1519,7 @@
       return el("div", {}, [el("div", { style: "font-size:0.75rem;color:var(--muted)" }, [k]), el("div", {}, [String(v)])]);
     }
     info.appendChild(pair("입력 교육일", app.educationDate));
+    info.appendChild(pair("교육기간", formatEducationPeriod(app)));
     info.appendChild(pair("입력 금액", money(app.amount)));
     info.appendChild(pair("방식/종류", app.method + " / " + app.category));
     info.appendChild(pair("과세", app.taxable ? "과세" : "비과세"));
@@ -1142,6 +1542,16 @@
         })
       );
     }
+    if (app.certificateDataUrl) {
+      card.appendChild(el("p", { style: "margin-top:1rem;font-size:0.85rem;color:var(--muted)" }, ["수료증·증빙 미리보기"]));
+      card.appendChild(
+        el("img", {
+          src: app.certificateDataUrl,
+          alt: "수료증",
+          style: "max-width:100%;border-radius:8px;border:1px solid var(--border)",
+        })
+      );
+    }
 
     card.appendChild(
       el("div", { class: "row", style: "margin-top:1rem" }, [
@@ -1149,6 +1559,30 @@
       ])
     );
     root.appendChild(card);
+  }
+
+  function appendEvidenceImages(container, app) {
+    if (!container || !app) return;
+    if (app.receiptDataUrl) {
+      container.appendChild(el("p", { style: "margin-top:1rem;font-size:0.85rem;color:var(--muted)" }, ["영수증 원본 이미지"]));
+      container.appendChild(
+        el("img", {
+          src: app.receiptDataUrl,
+          alt: "영수증 원본",
+          style: "max-width:100%;border-radius:8px;border:1px solid var(--border)",
+        })
+      );
+    }
+    if (app.certificateDataUrl) {
+      container.appendChild(el("p", { style: "margin-top:1rem;font-size:0.85rem;color:var(--muted)" }, ["수료증 원본 이미지"]));
+      container.appendChild(
+        el("img", {
+          src: app.certificateDataUrl,
+          alt: "수료증 원본",
+          style: "max-width:100%;border-radius:8px;border:1px solid var(--border)",
+        })
+      );
+    }
   }
 
   function renderManager(root, state) {
@@ -1223,6 +1657,7 @@
               el("tr", {}, [el("td", {}, ["신청자"]), el("td", {}, [textOrDash(emp ? emp.name : "")])]),
               el("tr", {}, [el("td", {}, ["상호"]), el("td", {}, [textOrDash(app.vendor)])]),
               el("tr", {}, [el("td", {}, ["교육일자"]), el("td", {}, [textOrDash(app.educationDate)])]),
+              el("tr", {}, [el("td", {}, ["교육기간"]), el("td", {}, [textOrDash(formatEducationPeriod(app))])]),
               el("tr", {}, [el("td", {}, ["금액"]), el("td", {}, [money(app.amount)])]),
               el("tr", {}, [el("td", {}, ["교육방식"]), el("td", {}, [textOrDash(app.method)])]),
               el("tr", {}, [el("td", {}, ["교육종류"]), el("td", {}, [textOrDash(app.category)])]),
@@ -1259,6 +1694,7 @@
     var statusMsg = el("p", { style: "color:var(--muted);min-height:1.2em;margin:0.5rem 0" }, [""]);
     var ocrHost = el("div", { class: "detail", html: ocrSummaryHtml(app) });
     card.appendChild(ocrHost);
+    appendEvidenceImages(card, app);
     card.appendChild(statusMsg);
     var note = el("textarea", { placeholder: "의견 (선택)", style: "margin-top:0.75rem" });
     card.appendChild(note);
@@ -1327,15 +1763,17 @@
     var rows = state.applications.filter(function (a) {
       return a.status === "approved";
     });
-    var header = ["신청ID", "신청자", "교육일", "업체", "금액", "과세여부", "종류", "직무연관", "영수증번호"];
+    var header = ["신청ID", "신청자", "교육일", "교육기간", "업체", "금액", "과세여부", "종류", "직무연관", "영수증번호"];
     var lines = [header.join(",")];
     rows.forEach(function (a) {
       var emp = getAccount(state, a.userId);
+      var period = formatEducationPeriod(a);
       lines.push(
         [
           a.id,
           emp ? emp.name : "",
           a.educationDate,
+          '"' + period.replace(/"/g, '""') + '"',
           '"' + (a.vendor || "").replace(/"/g, '""') + '"',
           a.amount,
           a.taxable ? "Y" : "N",
@@ -1354,6 +1792,61 @@
     URL.revokeObjectURL(url);
   }
 
+  /** 교육담당자: 신청 상호(및 OCR 상호)로 고용24 HRD-Net 등록 훈련기관 조회 안내 */
+  function buildAdminHrdNetVerifyPanel(app) {
+    var wrap = el("div", { class: "hl", style: "margin-top:0.75rem" });
+    wrap.appendChild(
+      el("div", { style: "font-weight:600;margin-bottom:0.35rem;font-size:0.9rem" }, ["HRD-Net(고용24) 등록 훈련기관 확인"])
+    );
+    wrap.appendChild(
+      el("p", { style: "margin:0 0 0.55rem;font-size:0.8rem;line-height:1.5;color:var(--text)" }, [
+        "고용24 ",
+        el("strong", {}, ["직업능력개발 > 훈련 찾기·신청 > 훈련 통합검색"]),
+        "에서 ",
+        el("strong", {}, ["검색어 범위: 훈련기관명"]),
+        "을 선택한 뒤 아래 링크로 검색하면, 해당 기관이 HRD-Net에 연계된 직업능력개발훈련 ",
+        el("strong", {}, ["등록 훈련기관"]),
+        "으로 조회되는지 확인할 수 있습니다.",
+      ])
+    );
+    function rowLink(label, keyword) {
+      var url = work24HrdTrainInstitutionSearchUrl(keyword);
+      if (!url) return null;
+      return el("div", { style: "margin-top:0.35rem;display:flex;flex-wrap:wrap;align-items:center;gap:0.45rem" }, [
+        el("span", { style: "font-size:0.75rem;color:var(--muted);min-width:6.5rem" }, [label]),
+        el("a", {
+          href: url,
+          target: "_blank",
+          rel: "noopener noreferrer",
+          class: "btn btn-primary",
+          style: "font-size:0.78rem;padding:0.32rem 0.65rem;text-decoration:none",
+        }, ["고용24 검색 (새 창)"]),
+      ]);
+    }
+    var v = String(app.vendor || "").trim();
+    var ocrV = "";
+    if (app.ocr && app.ocr.extracted && app.ocr.extracted.vendor) {
+      ocrV = String(app.ocr.extracted.vendor).trim();
+      var paren = ocrV.indexOf("(");
+      if (paren > 0) ocrV = ocrV.slice(0, paren).trim();
+      if (ocrV.indexOf("미검출") >= 0) ocrV = "";
+    }
+    var r0 = rowLink("신청 상호", v);
+    if (r0) wrap.appendChild(r0);
+    if (ocrV && stripSpaces(ocrV) !== stripSpaces(v)) {
+      var r1 = rowLink("OCR 추출 상호", ocrV);
+      if (r1) wrap.appendChild(r1);
+    }
+    wrap.appendChild(
+      el("p", { style: "margin:0.45rem 0 0;font-size:0.72rem;color:var(--muted);line-height:1.45" }, [
+        "도서·일반 구매 등 ",
+        el("strong", {}, ["비훈련기관"]),
+        " 과정은 검색되지 않을 수 있습니다. 최종 판단은 고용24 조회 결과에 따릅니다.",
+      ])
+    );
+    return wrap;
+  }
+
   function renderAdmin(root, state) {
     if (!guardRole(state, "admin")) return;
     root.innerHTML = "";
@@ -1365,7 +1858,9 @@
     var card = el("div", { class: "card" }, [
       el("h2", {}, ["담당자 검수 · 정산"]),
       el("p", { style: "margin:0 0 0.75rem;color:var(--muted);font-size:0.9rem" }, [
-        "직원 신청 내역 전체를 조회하고, OCR 점검 결과를 재검토할 수 있습니다.",
+        "직원 신청 내역 전체를 조회하고, OCR 점검 결과를 재검토할 수 있습니다. 각 건에서 ",
+        el("strong", {}, ["고용24(HRD-Net)"]),
+        " 링크로 등록 훈련기관 여부를 확인할 수 있습니다.",
       ]),
       el("div", { class: "row" }, [
         el("button", { class: "btn btn-ghost", onclick: function () { exportCsv(state); } }, ["정산 CSV (승인 건)"]),
@@ -1376,13 +1871,30 @@
     apps.forEach(function (a) {
       var mismatch = a.ocr && (!a.ocr.vendorMatch || !a.ocr.dateMatch || !a.ocr.amountMatch);
       var emp = getAccount(state, a.userId);
+      var hrdUrl = work24HrdTrainInstitutionSearchUrl(a.vendor);
+      var linkRow = null;
+      if (hrdUrl) {
+        linkRow = el("p", { style: "margin:0.4rem 0 0;font-size:0.78rem" }, [
+          el("a", {
+            href: hrdUrl,
+            target: "_blank",
+            rel: "noopener noreferrer",
+            style: "color:var(--accent)",
+            onclick: function (e) {
+              e.stopPropagation();
+            },
+          }, ["고용24에서 훈련기관(HRD-Net) 확인"]),
+        ]);
+      }
+      var itemKids = [
+        el("h3", {}, [(emp ? emp.name : "직원") + " · " + a.vendor + " · " + money(a.amount)]),
+        el("p", {}, [
+          (STATUS_LABEL[a.status] || a.status) + " · " + (mismatch ? "⚠ OCR 불일치" : "✓ OCR 일치"),
+        ]),
+      ];
+      if (linkRow) itemKids.push(linkRow);
       list.appendChild(
-        el("div", { class: "item", onclick: function () { setHash("a-approve", a.id); } }, [
-          el("h3", {}, [(emp ? emp.name : "직원") + " · " + a.vendor + " · " + money(a.amount)]),
-          el("p", {}, [
-            (STATUS_LABEL[a.status] || a.status) + " · " + (mismatch ? "⚠ OCR 불일치" : "✓ OCR 일치"),
-          ]),
-        ])
+        el("div", { class: "item", onclick: function () { setHash("a-approve", a.id); } }, itemKids)
       );
     });
     card.appendChild(list);
@@ -1423,6 +1935,7 @@
               el("tr", {}, [el("td", {}, ["신청자"]), el("td", {}, [textOrDash(emp ? emp.name : "")])]),
               el("tr", {}, [el("td", {}, ["상호"]), el("td", {}, [textOrDash(app.vendor)])]),
               el("tr", {}, [el("td", {}, ["교육일자"]), el("td", {}, [textOrDash(app.educationDate)])]),
+              el("tr", {}, [el("td", {}, ["교육기간"]), el("td", {}, [textOrDash(formatEducationPeriod(app))])]),
               el("tr", {}, [el("td", {}, ["금액"]), el("td", {}, [money(app.amount)])]),
               el("tr", {}, [el("td", {}, ["교육방식"]), el("td", {}, [textOrDash(app.method)])]),
               el("tr", {}, [el("td", {}, ["교육종류"]), el("td", {}, [textOrDash(app.category)])]),
@@ -1454,11 +1967,19 @@
         ])
       );
     }
+    var hrdVerifyHost = el("div");
+    function syncHrdVerifyPanel() {
+      hrdVerifyHost.innerHTML = "";
+      hrdVerifyHost.appendChild(buildAdminHrdNetVerifyPanel(app));
+    }
     buildComparePanels();
     card.appendChild(compareHost);
+    syncHrdVerifyPanel();
+    card.appendChild(hrdVerifyHost);
     var statusMsg = el("p", { style: "color:var(--muted);min-height:1.2em;margin:0.5rem 0" }, [""]);
     var ocrHost = el("div", { class: "detail", html: ocrSummaryHtml(app) });
     card.appendChild(ocrHost);
+    appendEvidenceImages(card, app);
     card.appendChild(statusMsg);
     var note = el("textarea", { placeholder: "검토 메모 (선택)", style: "margin-top:0.75rem" });
     card.appendChild(note);
@@ -1495,6 +2016,7 @@
               (!app.ocr.completionRequired || app.ocr.completionVerified);
             saveState(state);
             buildComparePanels();
+            syncHrdVerifyPanel();
             ocrHost.innerHTML = ocrSummaryHtml(app);
             statusMsg.style.color = "var(--success)";
             statusMsg.textContent = "OCR 재점검이 완료되었습니다.";
@@ -1528,6 +2050,152 @@
     }).length;
   }
 
+  function roleLabel(role) {
+    if (role === "employee") return "신청자";
+    if (role === "manager") return "부서장";
+    if (role === "admin") return "교육담당";
+    return role || "";
+  }
+
+  function normalizeRoleValue(v) {
+    var s = String(v || "")
+      .trim()
+      .toLowerCase();
+    if (s === "employee" || s === "신청자") return "employee";
+    if (s === "manager" || s === "부서장") return "manager";
+    if (s === "admin" || s === "교육담당" || s === "관리자") return "admin";
+    return "";
+  }
+
+  function memberExportRows(accounts) {
+    return (accounts || []).map(function (a) {
+      return {
+        loginId: a.loginId || "",
+        password: a.password || "",
+        name: a.name || "",
+        role: a.role || "",
+        roleLabel: roleLabel(a.role),
+        dept: a.dept || "",
+        title: a.title || "",
+      };
+    });
+  }
+
+  function exportMembersExcel(state) {
+    var rows = memberExportRows(state.accounts);
+    if (typeof XLSX === "undefined") {
+      var header = ["loginId", "password", "name", "role", "roleLabel", "dept", "title"];
+      var lines = [header.join(",")];
+      rows.forEach(function (r) {
+        lines.push(
+          [r.loginId, r.password, r.name, r.role, r.roleLabel, r.dept, r.title]
+            .map(function (x) {
+              return '"' + String(x || "").replace(/"/g, '""') + '"';
+            })
+            .join(",")
+        );
+      });
+      var blob = new Blob(["\ufeff" + lines.join("\n")], { type: "text/csv;charset=utf-8;" });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href = url;
+      a.download = "edu-smart-members.csv";
+      a.click();
+      URL.revokeObjectURL(url);
+      return;
+    }
+    var ws = XLSX.utils.json_to_sheet(rows);
+    var wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "members");
+    XLSX.writeFile(wb, "edu-smart-members.xlsx");
+  }
+
+  function readMembersUploadRows(file) {
+    return new Promise(function (resolve, reject) {
+      var ext = (file && file.name ? file.name.split(".").pop() : "").toLowerCase();
+      var fr = new FileReader();
+      fr.onerror = reject;
+      fr.onload = function () {
+        try {
+          if (ext === "csv") {
+            var text = String(fr.result || "");
+            var lines = text.split(/\r?\n/).filter(function (l) { return l.trim(); });
+            if (!lines.length) return resolve([]);
+            var header = lines[0].split(",").map(function (h) { return h.replace(/^\ufeff/, "").trim().replace(/^"|"$/g, ""); });
+            var out = [];
+            for (var i = 1; i < lines.length; i++) {
+              var vals = lines[i].split(",").map(function (v) { return v.trim().replace(/^"|"$/g, "").replace(/""/g, '"'); });
+              var row = {};
+              header.forEach(function (h, idx) { row[h] = vals[idx] || ""; });
+              out.push(row);
+            }
+            return resolve(out);
+          }
+          if (typeof XLSX === "undefined") {
+            return reject(new Error("엑셀(xlsx) 업로드를 위해 SheetJS 로드가 필요합니다."));
+          }
+          var wb = XLSX.read(fr.result, { type: "array" });
+          var ws = wb.Sheets[wb.SheetNames[0]];
+          var json = XLSX.utils.sheet_to_json(ws, { defval: "" });
+          resolve(json);
+        } catch (e) {
+          reject(e);
+        }
+      };
+      if (ext === "csv") fr.readAsText(file, "utf-8");
+      else fr.readAsArrayBuffer(file);
+    });
+  }
+
+  function importMembersFromRows(state, rows, meId) {
+    var rowList = rows || [];
+    var touched = 0;
+    var inserted = 0;
+    var updated = 0;
+    var skipped = 0;
+    var byLogin = {};
+    state.accounts.forEach(function (a) {
+      byLogin[String(a.loginId || "").trim()] = a;
+    });
+
+    rowList.forEach(function (r) {
+      var loginId = String((r.loginId != null ? r.loginId : r["로그인ID"] || r["로그인 ID"] || "")).trim();
+      var name = String((r.name != null ? r.name : r["이름"] || "")).trim();
+      var password = String((r.password != null ? r.password : r["비밀번호"] || "")).trim();
+      var role = normalizeRoleValue(r.role != null ? r.role : (r.roleLabel != null ? r.roleLabel : r["역할"] || ""));
+      var dept = String((r.dept != null ? r.dept : r["부서"] || "")).trim() || "—";
+      var title = String((r.title != null ? r.title : r["직함"] || "")).trim() || "—";
+      if (!loginId || !name || !password || !role) {
+        skipped++;
+        return;
+      }
+      touched++;
+      var ex = byLogin[loginId];
+      if (ex) {
+        ex.name = name;
+        ex.password = password;
+        if (!(ex.id === meId && ex.role === "admin" && role !== "admin" && countAdmins(state) <= 1)) ex.role = role;
+        ex.dept = dept;
+        ex.title = title;
+        updated++;
+      } else {
+        var n = {
+          id: "acc_" + Math.random().toString(36).slice(2, 12),
+          loginId: loginId,
+          password: password,
+          name: name,
+          role: role,
+          dept: dept,
+          title: title,
+        };
+        state.accounts.push(n);
+        byLogin[loginId] = n;
+        inserted++;
+      }
+    });
+    return { touched: touched, inserted: inserted, updated: updated, skipped: skipped };
+  }
+
 
   function renderMembers(root, state) {
     if (!guardRole(state, "admin")) return;
@@ -1546,6 +2214,7 @@
     nRole.appendChild(el("option", { value: "employee" }, ["신청자"]));
     nRole.appendChild(el("option", { value: "manager" }, ["부서장"]));
     nRole.appendChild(el("option", { value: "admin" }, ["교육담당"]));
+    var uploadInput = el("input", { type: "file", accept: ".xlsx,.xls,.csv", style: "display:none" });
 
     function fieldRow(label, node) {
       return el("div", { class: "field" }, [el("label", {}, [label]), node]);
@@ -1554,6 +2223,13 @@
     var addForm = el("div", { class: "card" }, [
       el("h2", {}, ["회원 등록"]),
       err,
+      el("div", { class: "row", style: "margin-bottom:0.7rem" }, [
+        el("button", { type: "button", class: "btn btn-ghost", onclick: function () { exportMembersExcel(state); } }, ["회원 엑셀 다운로드"]),
+        el("button", { type: "button", class: "btn btn-ghost", onclick: function () { uploadInput.click(); } }, ["회원 엑셀 업로드"]),
+      ]),
+      el("p", { class: "footer-note", style: "margin:0 0 0.8rem" }, [
+        "업로드 컬럼: loginId, password, name, role(또는 roleLabel), dept, title. 기존 loginId는 수정(업데이트), 없으면 신규 등록됩니다.",
+      ]),
       el("div", { class: "grid grid-2" }, [
         fieldRow("로그인 ID *", nLogin),
         fieldRow("비밀번호 *", nPass),
@@ -1601,6 +2277,33 @@
         } }, ["등록"]),
       ]),
     ]);
+    uploadInput.addEventListener("change", function () {
+      var f = uploadInput.files && uploadInput.files[0];
+      if (!f) return;
+      err.style.color = "var(--muted)";
+      err.textContent = "회원 파일을 읽는 중...";
+      readMembersUploadRows(f)
+        .then(function (rows) {
+          var rs = importMembersFromRows(state, rows, me && me.id);
+          if (!rs.touched && rs.skipped) {
+            err.style.color = "var(--danger)";
+            err.textContent = "유효한 행이 없습니다. 필수 컬럼(loginId/password/name/role)을 확인해 주세요.";
+            return;
+          }
+          saveState(state);
+          err.style.color = "var(--success)";
+          err.textContent =
+            "업로드 완료: 신규 " + rs.inserted + "건, 수정 " + rs.updated + "건, 건너뜀 " + rs.skipped + "건";
+          route();
+        })
+        .catch(function (e) {
+          err.style.color = "var(--danger)";
+          err.textContent = "업로드 실패: " + (e && e.message ? e.message : String(e));
+        })
+        .finally(function () {
+          uploadInput.value = "";
+        });
+    });
     root.appendChild(addForm);
 
     var tblCard = el("div", { class: "card" }, [el("h2", {}, ["회원 목록"])]);
